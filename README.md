@@ -31,35 +31,6 @@ CD-Rocketry/
 6. **Advanced Predictive Analytics (`monte_carlo.py` & `ml_surrogate.py`):** * The **Monte Carlo** module runs thousands of parallel simulations, injecting Gaussian noise into variables like ignition wind angle and total motor impulse to map out a probabilistic landing zone dispersion.
 * The **ML Surrogate** module uses a trained regression model to bypass the physics loop entirely, outputting instant apogee and safety margin predictions based on inputs.
 
-
-
----
-
-## Installation and Execution
-
-### Prerequisites
-
-The project requires Python 3.x and standard scientific computing libraries (`numpy`, `scipy`).
-
-### Setup
-
-Clone the repository to your local machine:
-
-```bash
-git clone [https://github.com/YOUR_USERNAME/CD-Rocketry.git](https://github.com/YOUR_USERNAME/CD-Rocketry.git)
-cd CD-Rocketry
-
-```
-
-### Running the Project
-
-To run a standard simulation baseline and execute the analytical modules, run:
-
-```bash
-python main.py
-
-```
-
 ---
 
 ## Technical Specifications
