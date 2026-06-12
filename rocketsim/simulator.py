@@ -83,7 +83,7 @@ class FlightResult:
         idx_apogee = int(np.argmax(self.altitude))
         self.apogee_m     = float(self.altitude[idx_apogee])
         self.apogee_time  = float(self.time[idx_apogee])
-        self.max_velocity = float(np.max(np.abs(self.velocity)))
+        self.max_velocity = float(np.max(np.sqrt(self.velocity**2 + self.vx**2)))
         self.max_mach     = float(np.max(self.mach))
         self.max_accel    = float(np.max(self.accel))
         self.max_q        = float(np.max(self.dyn_pressure))
@@ -156,6 +156,7 @@ class RocketSimulator:
         launch_angle_rad = np.radians(self.config.launch_angle_deg)
         sin_a = np.sin(launch_angle_rad)
         cos_a = np.cos(launch_angle_rad)  # horizontal component
+        wind_x = float(self.atm.wind_vector()[0])
 
         # Initial state: [altitude, vertical_vel, horizontal_vel]
         z  = 0.0
@@ -173,7 +174,9 @@ class RocketSimulator:
 
         while t <= max_time:
             m = self.config.body_mass_kg + motor.mass(t)
-            v_total = np.sqrt(vz**2 + vx**2)
+            rel_vz = vz
+            rel_vx = vx - wind_x
+            airspeed = np.sqrt(rel_vz**2 + rel_vx**2)
 
             T = motor.thrust(t) * self.thrust_scale
 
@@ -182,19 +185,19 @@ class RocketSimulator:
 
             # Drag — acts along velocity vector
             rho  = self.atm.density(z)
-            mach = self.atm.mach_number(z, v_total)
+            mach = self.atm.mach_number(z, airspeed)
             Cd   = aero.drag_coefficient(mach) * self.cd_scale
-            D    = 0.5 * rho * v_total**2 * Cd * aero.ref_area
+            D    = 0.5 * rho * airspeed**2 * Cd * aero.ref_area
 
             # Parachute drag
             if drogue_deployed or main_deployed:
-                D_chute = 0.5 * rho * v_total**2 * parachute_cd_area
+                D_chute = 0.5 * rho * airspeed**2 * parachute_cd_area
                 D += D_chute
 
             # Net force components along trajectory and horizontal
-            if v_total > 0.01:
-                drag_z = D * (vz / v_total)
-                drag_x = D * (vx / v_total)
+            if airspeed > 0.01:
+                drag_z = D * (rel_vz / airspeed)
+                drag_x = D * (rel_vx / airspeed)
             else:
                 drag_z = 0.0
                 drag_x = 0.0
@@ -211,12 +214,12 @@ class RocketSimulator:
             az = (T_z - drag_z) / m - g
             ax = (T_x - drag_x) / m
 
-            dyn_pressure = 0.5 * rho * v_total**2
+            dyn_pressure = 0.5 * rho * airspeed**2
 
             # Record state
             st = FlightState(
                 time=t, altitude=z, velocity=vz, vx=vx,
-                mass=m, thrust=T, drag=D, accel=abs(az),
+                mass=m, thrust=T, drag=D, accel=float(np.sqrt(az**2 + ax**2)),
                 mach=mach, dyn_pressure=dyn_pressure, phase=phase,
             )
             states.append(st)
@@ -245,18 +248,20 @@ class RocketSimulator:
             # RK4 integration of [z, vz, vx]
             def derivatives(state, time):
                 sz, svz, svx = state
-                sv_total = np.sqrt(svz**2 + svx**2)
+                srel_vz = svz
+                srel_vx = svx - wind_x
+                sairspeed = np.sqrt(srel_vz**2 + srel_vx**2)
                 sm = self.config.body_mass_kg + motor.mass(time)
                 sg = self.G0 * (self.RE / (self.RE + max(0, sz)))**2
                 srho = self.atm.density(max(0, sz))
-                smach = self.atm.mach_number(max(0, sz), sv_total)
+                smach = self.atm.mach_number(max(0, sz), sairspeed)
                 sCd   = aero.drag_coefficient(smach) * self.cd_scale
-                sD    = 0.5 * srho * sv_total**2 * sCd * aero.ref_area
+                sD    = 0.5 * srho * sairspeed**2 * sCd * aero.ref_area
                 if drogue_deployed or main_deployed:
-                    sD += 0.5 * srho * sv_total**2 * parachute_cd_area
-                if sv_total > 0.01:
-                    sdrag_z = sD * (svz / sv_total)
-                    sdrag_x = sD * (svx / sv_total)
+                    sD += 0.5 * srho * sairspeed**2 * parachute_cd_area
+                if sairspeed > 0.01:
+                    sdrag_z = sD * (srel_vz / sairspeed)
+                    sdrag_x = sD * (srel_vx / sairspeed)
                 else:
                     sdrag_z = sdrag_x = 0.0
                 if motor.is_burning(time):
