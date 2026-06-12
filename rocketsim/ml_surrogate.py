@@ -1,361 +1,279 @@
 """
-GPU-Accelerated ML Surrogate Model (RTX 5070 / CUDA)
+Lightweight ML surrogate model for rocket flight outputs.
 
-Replaces sklearn MLPRegressor with a PyTorch neural network that runs
-on the GPU via CUDA. Falls back to CPU if CUDA is not available.
-
-GPU acceleration benefits here:
-  - Batch inference over thousands of Monte Carlo parameter sets in ms
-  - Fast training via cuBLAS/cuDNN on the MLP
-  - Parallel parameter estimation via batched forward passes
-
-Requires:  pip install torch  (CUDA build for RTX 5070: torch+cu128)
+The surrogate intentionally depends only on NumPy so the core project can run
+without optional scientific stacks such as SciPy, scikit-learn, or PyTorch.
+It fits a ridge-regularized quadratic response surface for each output.
 """
 
+from typing import Callable, List, Optional, Tuple
+
 import numpy as np
-from typing import List, Tuple, Optional, Callable
-import warnings
-
-# ── Try GPU stack; fall back gracefully ──────────────────────────────────────
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import DataLoader, TensorDataset
-    TORCH_AVAILABLE = True
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-except ImportError:
-    TORCH_AVAILABLE = False
-    DEVICE = None
-
-# sklearn used only when torch unavailable
-if not TORCH_AVAILABLE:
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.neural_network import MLPRegressor
-    from sklearn.pipeline import Pipeline
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, mean_absolute_error
-else:
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, mean_absolute_error
-
-from scipy.optimize import differential_evolution, minimize
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PyTorch MLP definition
-# ─────────────────────────────────────────────────────────────────────────────
+class MLSurrogate:
+    """Fast surrogate model for apogee, max velocity, and max Mach."""
 
-class _MLP(nn.Module):
-    """Simple fully-connected network with BatchNorm and residual skip."""
+    FEATURE_NAMES = [
+        "cd_scale",
+        "thrust_scale",
+        "body_mass_kg",
+        "launch_angle_deg",
+        "wind_speed_ms",
+    ]
 
-    def __init__(self, in_dim: int, hidden: Tuple[int, ...], out_dim: int = 1):
-        super().__init__()
-        layers = []
-        prev = in_dim
-        for h in hidden:
-            layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.SiLU()]
-            prev = h
-        layers.append(nn.Linear(prev, out_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class _TorchSurrogate:
-    """Wrapper: trains one _MLP per output variable on GPU."""
-
-    def __init__(self, hidden=(128, 128, 64), lr=1e-3, max_epochs=500, batch=256):
-        self.hidden = hidden
-        self.lr = lr
-        self.max_epochs = max_epochs
-        self.batch = batch
-        self.models = {}
-        self.x_mean = None
-        self.x_std  = None
-        self.y_stats = {}
-
-    def _normalise_X(self, X: np.ndarray) -> "torch.Tensor":
-        return torch.tensor((X - self.x_mean) / (self.x_std + 1e-8),
-                             dtype=torch.float32, device=DEVICE)
-
-    def fit(self, X: np.ndarray, y_dict: dict) -> dict:
-        self.x_mean = X.mean(axis=0)
-        self.x_std  = X.std(axis=0)
-        Xt = self._normalise_X(X)
-        metrics = {}
-
-        for key, y_raw in y_dict.items():
-            y_mean = y_raw.mean()
-            y_std  = y_raw.std() + 1e-8
-            self.y_stats[key] = (y_mean, y_std)
-            y_norm = (y_raw - y_mean) / y_std
-
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                Xt.cpu().numpy(), y_norm, test_size=0.2, random_state=42)
-
-            X_tr_t = torch.tensor(X_tr, dtype=torch.float32, device=DEVICE)
-            y_tr_t = torch.tensor(y_tr, dtype=torch.float32, device=DEVICE).unsqueeze(1)
-
-            model = _MLP(X.shape[1], self.hidden).to(DEVICE)
-            opt   = optim.AdamW(model.parameters(), lr=self.lr, weight_decay=1e-4)
-            sched = optim.lr_scheduler.CosineAnnealingLR(opt, self.max_epochs)
-            ds    = TensorDataset(X_tr_t, y_tr_t)
-            dl    = DataLoader(ds, batch_size=self.batch, shuffle=True)
-
-            model.train()
-            best_loss = float("inf")
-            patience  = 0
-            best_state = None
-            for epoch in range(self.max_epochs):
-                for xb, yb in dl:
-                    opt.zero_grad()
-                    loss = nn.functional.mse_loss(model(xb), yb)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    opt.step()
-                sched.step()
-                # Early stopping
-                model.eval()
-                with torch.no_grad():
-                    val_loss = nn.functional.mse_loss(
-                        model(X_tr_t), y_tr_t).item()
-                if val_loss < best_loss - 1e-5:
-                    best_loss = val_loss
-                    best_state = {k: v.clone() for k, v in model.state_dict().items()}
-                    patience = 0
-                else:
-                    patience += 1
-                if patience > 40:
-                    break
-                model.train()
-
-            if best_state:
-                model.load_state_dict(best_state)
-
-            # Evaluate
-            model.eval()
-            X_te_t = torch.tensor(X_te, dtype=torch.float32, device=DEVICE)
-            with torch.no_grad():
-                y_pred_norm = model(X_te_t).cpu().numpy().squeeze()
-            y_pred = y_pred_norm * y_std + y_mean
-            y_true = y_te * y_std + y_mean
-            r2  = r2_score(y_true, y_pred)
-            mae = mean_absolute_error(y_true, y_pred)
-            metrics[key] = {"r2": round(r2, 4), "mae": round(mae, 3)}
-            self.models[key] = model
-
-        return metrics
-
-    def predict_batch(self, X: np.ndarray) -> dict:
-        """Predict all outputs for a batch of inputs. Returns dict of arrays."""
-        Xt = self._normalise_X(X)
-        results = {}
-        for key, model in self.models.items():
-            model.eval()
-            with torch.no_grad():
-                y_norm = model(Xt).cpu().numpy().squeeze()
-            y_mean, y_std = self.y_stats[key]
-            results[key] = y_norm * y_std + y_mean
-        return results
-
-    def predict_one(self, x: np.ndarray) -> dict:
-        out = self.predict_batch(x.reshape(1, -1))
-        return {k: float(v[0]) for k, v in out.items()}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API  (drop-in replacement for ml_surrogate.MLSurrogate)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MLSurrogateGPU:
-    """GPU-accelerated surrogate; falls back to sklearn if PyTorch unavailable."""
-
-    FEATURE_NAMES = ["cd_scale", "thrust_scale", "body_mass_kg",
-                     "launch_angle_deg", "wind_speed_ms"]
-
-    def __init__(self, simulator_fn: Callable,
-                 output_keys: Optional[List[str]] = None):
+    def __init__(
+        self,
+        simulator_fn: Callable,
+        output_keys: Optional[List[str]] = None,
+        ridge_alpha: float = 1e-6,
+    ):
         self.simulator_fn = simulator_fn
-        self.output_keys  = output_keys or ["apogee_m", "max_velocity_ms", "max_mach"]
-        self._torch_model: Optional[_TorchSurrogate] = None
-        self._sklearn_models: dict = {}
+        self.output_keys = output_keys or ["apogee_m", "max_velocity_ms", "max_mach"]
+        self.ridge_alpha = ridge_alpha
         self._X_train = None
-        self._y_train: dict = {}
+        self._y_train = {}
+        self._x_mean = None
+        self._x_std = None
+        self._weights = {}
         self.is_trained = False
-        self.using_gpu  = TORCH_AVAILABLE and DEVICE.type == "cuda"
-        self.device_str = str(DEVICE) if TORCH_AVAILABLE else "cpu (sklearn)"
 
-    # ── Data generation ──────────────────────────────────────────────────────
-
-    def generate_training_data(self, n_samples=300, param_bounds=None,
-                               seed=0) -> Tuple[np.ndarray, dict]:
+    def generate_training_data(
+        self,
+        n_samples: int = 300,
+        param_bounds: Optional[dict] = None,
+        seed: int = 0,
+    ) -> Tuple[np.ndarray, dict]:
+        """Generate Latin-hypercube samples and evaluate the simulator."""
         rng = np.random.default_rng(seed)
         bounds = param_bounds or {
-            "cd_scale":         (0.7, 1.3),
-            "thrust_scale":     (0.85, 1.15),
-            "body_mass_kg":     (1.5, 3.5),
+            "cd_scale": (0.7, 1.3),
+            "thrust_scale": (0.85, 1.15),
+            "body_mass_kg": (1.5, 3.5),
             "launch_angle_deg": (80.0, 90.0),
-            "wind_speed_ms":    (0.0, 8.0),
+            "wind_speed_ms": (0.0, 8.0),
         }
-        n_feat = len(self.FEATURE_NAMES)
-        lhs = np.zeros((n_samples, n_feat))
-        for j in range(n_feat):
-            perm = rng.permutation(n_samples)
-            lhs[:, j] = (perm + rng.random(n_samples)) / n_samples
+
+        lhs = np.zeros((n_samples, len(self.FEATURE_NAMES)))
+        for col in range(lhs.shape[1]):
+            order = rng.permutation(n_samples)
+            lhs[:, col] = (order + rng.random(n_samples)) / n_samples
+
         X = np.zeros_like(lhs)
-        for j, name in enumerate(self.FEATURE_NAMES):
-            lo, hi = bounds[name]
-            X[:, j] = lo + lhs[:, j] * (hi - lo)
+        for col, name in enumerate(self.FEATURE_NAMES):
+            low, high = bounds[name]
+            X[:, col] = low + lhs[:, col] * (high - low)
 
-        y_dict = {k: [] for k in self.output_keys}
-        for i in range(n_samples):
-            params = dict(zip(self.FEATURE_NAMES, X[i]))
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                result = self.simulator_fn(**params)
-            for k in self.output_keys:
-                y_dict[k].append(result.get(k, 0.0))
-
-        for k in self.output_keys:
-            y_dict[k] = np.array(y_dict[k])
-        self._X_train = X
-        self._y_train = y_dict
-        return X, y_dict
-
-    # ── Training ─────────────────────────────────────────────────────────────
-
-    def train(self, X=None, y_dict=None, max_iter=500) -> dict:
-        X      = X      or self._X_train
-        y_dict = y_dict or self._y_train
-        assert X is not None
-
-        if TORCH_AVAILABLE:
-            self._torch_model = _TorchSurrogate(
-                hidden=(128, 128, 64), max_epochs=max_iter)
-            metrics = self._torch_model.fit(X, y_dict)
-        else:
-            # sklearn fallback
-            from sklearn.preprocessing import StandardScaler
-            from sklearn.neural_network import MLPRegressor
-            from sklearn.pipeline import Pipeline
-            metrics = {}
+        y_dict = {key: [] for key in self.output_keys}
+        for row in X:
+            result = self.simulator_fn(**dict(zip(self.FEATURE_NAMES, row)))
             for key in self.output_keys:
-                y = y_dict[key]
-                X_tr, X_te, y_tr, y_te = train_test_split(
-                    X, y, test_size=0.2, random_state=42)
-                pipe = Pipeline([
-                    ("sc", StandardScaler()),
-                    ("mlp", MLPRegressor(hidden_layer_sizes=(64,64,32),
-                                         max_iter=max_iter, random_state=42,
-                                         early_stopping=True)),
-                ])
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    pipe.fit(X_tr, y_tr)
-                y_pred = pipe.predict(X_te)
-                metrics[key] = {
-                    "r2": round(r2_score(y_te, y_pred), 4),
-                    "mae": round(mean_absolute_error(y_te, y_pred), 3),
-                }
-                self._sklearn_models[key] = pipe
+                y_dict[key].append(float(result.get(key, 0.0)))
+
+        self._X_train = X
+        self._y_train = {key: np.array(values) for key, values in y_dict.items()}
+        return self._X_train, self._y_train
+
+    def train(self, X=None, y_dict=None, max_iter=None) -> dict:
+        """Fit one quadratic ridge model per output and return validation metrics."""
+        X = self._X_train if X is None else np.asarray(X, dtype=float)
+        y_dict = self._y_train if y_dict is None else y_dict
+        if X is None or not y_dict:
+            raise ValueError("Call generate_training_data() or pass X and y_dict first.")
+
+        self._x_mean = X.mean(axis=0)
+        self._x_std = X.std(axis=0) + 1e-8
+        design = self._design_matrix(X)
+
+        rng = np.random.default_rng(42)
+        indices = rng.permutation(len(X))
+        split = max(1, int(0.8 * len(X)))
+        train_idx = indices[:split]
+        test_idx = indices[split:] if split < len(X) else indices[:split]
+
+        metrics = {}
+        for key in self.output_keys:
+            y = np.asarray(y_dict[key], dtype=float)
+            phi_train = design[train_idx]
+            y_train = y[train_idx]
+
+            penalty = self.ridge_alpha * np.eye(phi_train.shape[1])
+            penalty[0, 0] = 0.0
+            lhs = phi_train.T @ phi_train + penalty
+            rhs = phi_train.T @ y_train
+            weights = np.linalg.solve(lhs, rhs)
+            self._weights[key] = weights
+
+            y_true = y[test_idx]
+            y_pred = design[test_idx] @ weights
+            ss_res = float(np.sum((y_true - y_pred) ** 2))
+            ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+            mae = float(np.mean(np.abs(y_true - y_pred)))
+            metrics[key] = {"r2": round(r2, 4), "mae": round(mae, 3)}
 
         self.is_trained = True
         return metrics
 
-    # ── Inference ────────────────────────────────────────────────────────────
+    def predict(
+        self,
+        cd_scale=1.0,
+        thrust_scale=1.0,
+        body_mass_kg=2.0,
+        launch_angle_deg=90.0,
+        wind_speed_ms=0.0,
+    ) -> dict:
+        """Predict all configured outputs for one parameter set."""
+        X = np.array(
+            [[cd_scale, thrust_scale, body_mass_kg, launch_angle_deg, wind_speed_ms]],
+            dtype=float,
+        )
+        return {key: float(values[0]) for key, values in self.predict_batch(X).items()}
 
-    def predict(self, cd_scale=1.0, thrust_scale=1.0, body_mass_kg=2.0,
-                launch_angle_deg=90.0, wind_speed_ms=0.0) -> dict:
-        assert self.is_trained
-        x = np.array([[cd_scale, thrust_scale, body_mass_kg,
-                       launch_angle_deg, wind_speed_ms]])
-        if TORCH_AVAILABLE:
-            return self._torch_model.predict_one(x[0])
-        else:
-            return {k: float(self._sklearn_models[k].predict(x)[0])
-                    for k in self.output_keys}
+    def predict_batch(self, X: np.ndarray) -> dict:
+        """Predict all configured outputs for a batch of parameter rows."""
+        if not self.is_trained:
+            raise RuntimeError("Call train() before predict().")
+        design = self._design_matrix(np.asarray(X, dtype=float))
+        return {key: design @ weights for key, weights in self._weights.items()}
 
     def predict_batch_gpu(self, X: np.ndarray) -> dict:
-        """Predict a large batch at once — maximises GPU utilisation."""
-        assert self.is_trained
-        if TORCH_AVAILABLE:
-            return self._torch_model.predict_batch(X)
-        else:
-            return {k: self._sklearn_models[k].predict(X)
-                    for k in self.output_keys}
+        """Compatibility alias for the previous GPU-oriented API."""
+        return self.predict_batch(X)
 
-    # ── Parameter estimation ─────────────────────────────────────────────────
+    def estimate_parameters(
+        self,
+        observed: dict,
+        param_bounds: Optional[dict] = None,
+        method: str = "random_search",
+    ) -> dict:
+        """Estimate free parameters by minimizing normalized output residuals."""
+        if not self.is_trained:
+            raise RuntimeError("Call train() before estimate_parameters().")
 
-    def estimate_parameters(self, observed: dict, param_bounds=None,
-                             method="differential_evolution") -> dict:
-        assert self.is_trained
-        bounds_dict = param_bounds or {
-            "cd_scale":     (0.5, 2.0),
+        bounds = param_bounds or {
+            "cd_scale": (0.5, 2.0),
             "thrust_scale": (0.7, 1.3),
         }
-        defaults = {"body_mass_kg": 2.0, "launch_angle_deg": 90.0,
-                    "wind_speed_ms": 0.0}
-        param_names = list(bounds_dict.keys())
-        bounds_list = [bounds_dict[k] for k in param_names]
+        defaults = {
+            "cd_scale": 1.0,
+            "thrust_scale": 1.0,
+            "body_mass_kg": 2.0,
+            "launch_angle_deg": 90.0,
+            "wind_speed_ms": 0.0,
+        }
+        names = list(bounds)
+        rng = np.random.default_rng(42)
 
-        def objective(theta):
-            kwargs = dict(defaults)
-            kwargs.update(dict(zip(param_names, theta)))
-            pred = self.predict(**kwargs)
-            loss = 0.0
-            for k, v_obs in observed.items():
-                if k in pred and abs(v_obs) > 1e-9:
-                    loss += ((pred[k] - v_obs) / v_obs) ** 2
-            return loss
+        candidates = []
+        midpoint = {name: (low + high) / 2 for name, (low, high) in bounds.items()}
+        candidates.append(midpoint)
+        for _ in range(2000):
+            candidates.append(
+                {name: rng.uniform(low, high) for name, (low, high) in bounds.items()}
+            )
 
-        if method == "differential_evolution":
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                result = differential_evolution(objective, bounds=bounds_list,
-                                                seed=42, maxiter=500, tol=1e-8)
-        else:
-            x0 = np.array([(b[0]+b[1])/2 for b in bounds_list])
-            result = minimize(objective, x0, bounds=bounds_list, method="L-BFGS-B")
+        best_params = None
+        best_loss = float("inf")
+        for candidate in candidates:
+            kwargs = {**defaults, **candidate}
+            loss = self._loss(kwargs, observed)
+            if loss < best_loss:
+                best_loss = loss
+                best_params = candidate
 
-        best = dict(zip(param_names, result.x))
-        pred_best = self.predict(**{**defaults, **best})
-        residuals = {k: round(pred_best.get(k, 0) - v, 3)
-                     for k, v in observed.items() if k in pred_best}
+        # Coordinate refinement around the best random candidate.
+        step_sizes = {
+            name: (bounds[name][1] - bounds[name][0]) / 8.0 for name in names
+        }
+        for _ in range(40):
+            improved = False
+            for name in names:
+                for direction in (-1.0, 1.0):
+                    low, high = bounds[name]
+                    trial = dict(best_params)
+                    trial[name] = float(
+                        np.clip(trial[name] + direction * step_sizes[name], low, high)
+                    )
+                    kwargs = {**defaults, **trial}
+                    loss = self._loss(kwargs, observed)
+                    if loss < best_loss:
+                        best_loss = loss
+                        best_params = trial
+                        improved = True
+            if not improved:
+                step_sizes = {name: step / 2.0 for name, step in step_sizes.items()}
+
+        final_kwargs = {**defaults, **best_params}
+        prediction = self.predict(**final_kwargs)
+        residuals = {
+            key: round(prediction[key] - value, 3)
+            for key, value in observed.items()
+            if key in prediction
+        }
         return {
-            "estimated_params":  {k: round(v, 4) for k, v in best.items()},
-            "predicted_outputs": {k: round(v, 2) for k, v in pred_best.items()},
-            "observed_outputs":  observed,
-            "residuals":         residuals,
-            "optimizer_success": bool(getattr(result, "success", True)),
-            "final_loss":        round(float(result.fun), 8),
+            "estimated_params": {
+                key: round(float(value), 4) for key, value in best_params.items()
+            },
+            "predicted_outputs": {
+                key: round(float(value), 2) for key, value in prediction.items()
+            },
+            "observed_outputs": observed,
+            "residuals": residuals,
+            "optimizer_success": True,
+            "final_loss": round(float(best_loss), 8),
         }
 
-    # ── Sensitivity ──────────────────────────────────────────────────────────
+    def sensitivity_analysis(
+        self,
+        target: str = "apogee_m",
+        n_points: int = 50,
+        base_params: Optional[dict] = None,
+    ) -> dict:
+        """Sweep each feature independently and return target predictions."""
+        if not self.is_trained:
+            raise RuntimeError("Call train() before sensitivity_analysis().")
 
-    def sensitivity_analysis(self, target="apogee_m", n_points=50,
-                              base_params=None) -> dict:
-        assert self.is_trained
-        base = base_params or {"cd_scale": 1.0, "thrust_scale": 1.0,
-                                "body_mass_kg": 2.0, "launch_angle_deg": 90.0,
-                                "wind_speed_ms": 0.0}
+        base = base_params or {
+            "cd_scale": 1.0,
+            "thrust_scale": 1.0,
+            "body_mass_kg": 2.0,
+            "launch_angle_deg": 90.0,
+            "wind_speed_ms": 0.0,
+        }
         ranges = {
-            "cd_scale":         np.linspace(0.7, 1.5, n_points),
-            "thrust_scale":     np.linspace(0.8, 1.2, n_points),
-            "body_mass_kg":     np.linspace(1.0, 4.0, n_points),
+            "cd_scale": np.linspace(0.7, 1.5, n_points),
+            "thrust_scale": np.linspace(0.8, 1.2, n_points),
+            "body_mass_kg": np.linspace(1.0, 4.0, n_points),
             "launch_angle_deg": np.linspace(75.0, 90.0, n_points),
-            "wind_speed_ms":    np.linspace(0.0, 15.0, n_points),
+            "wind_speed_ms": np.linspace(0.0, 15.0, n_points),
         }
+
         results = {}
-        for param, vals in ranges.items():
-            # Build a batch for GPU efficiency
-            X_batch = np.tile(
-                [base["cd_scale"], base["thrust_scale"], base["body_mass_kg"],
-                 base["launch_angle_deg"], base["wind_speed_ms"]],
-                (n_points, 1))
-            feat_idx = self.FEATURE_NAMES.index(param)
-            X_batch[:, feat_idx] = vals
-            preds = self.predict_batch_gpu(X_batch)
-            results[param] = (vals, preds[target])
+        base_row = np.array([base[name] for name in self.FEATURE_NAMES], dtype=float)
+        for name, values in ranges.items():
+            batch = np.tile(base_row, (n_points, 1))
+            batch[:, self.FEATURE_NAMES.index(name)] = values
+            results[name] = (values, self.predict_batch(batch)[target])
         return results
+
+    def _design_matrix(self, X: np.ndarray) -> np.ndarray:
+        scaled = (X - self._x_mean) / self._x_std
+        columns = [np.ones(len(scaled))]
+        columns.extend(scaled[:, i] for i in range(scaled.shape[1]))
+        columns.extend(scaled[:, i] ** 2 for i in range(scaled.shape[1]))
+        for i in range(scaled.shape[1]):
+            for j in range(i + 1, scaled.shape[1]):
+                columns.append(scaled[:, i] * scaled[:, j])
+        return np.column_stack(columns)
+
+    def _loss(self, kwargs: dict, observed: dict) -> float:
+        prediction = self.predict(**kwargs)
+        loss = 0.0
+        for key, observed_value in observed.items():
+            if key in prediction and abs(observed_value) > 1e-12:
+                loss += ((prediction[key] - observed_value) / observed_value) ** 2
+        return float(loss)
+
+
+MLSurrogateGPU = MLSurrogate

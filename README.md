@@ -1,58 +1,80 @@
-
 # CD Rocketry: Advanced Flight Simulation Framework
 
-CD Rocketry is a modular Python framework designed to simulate and analyze model rocket flight trajectories. The system integrates traditional aerodynamic physics with stochastic analysis and machine learning to predict flight performance, apogee, and landing zones.
+CD Rocketry is a modular Python framework for simulating and analyzing model
+rocket flight trajectories. It combines aerodynamic physics, standard
+atmosphere calculations, motor thrust curves, Monte Carlo uncertainty analysis,
+and a lightweight surrogate model for fast performance estimates.
 
-## System Architecture and Workflow
-
-The framework operates by splitting the physics and analysis into distinct, independent modules under the `rocketsim` package. 
+## Project Layout
 
 ```text
 CD-Rocketry/
-├── main.py                 # Simulation execution and configuration entry point
-└── rocketsim/
-    ├── __init__.py         # Package initialization
-    ├── simulator.py        # Core numerical integration engine
-    ├── aerodynamics.py     # Lift, drag, and stability calculations
-    ├── atmosphere.py       # Barometric models and wind vector simulation
-    ├── motor.py            # Solid motor thrust curves and mass depletion
-    ├── monte_carlo.py      # Statistical dispersion and uncertainty wrapper
-    └── ml_surrogate.py     # Machine learning acceleration layer
-
+|-- main.py                 # End-to-end demo and configuration entry point
+|-- pyproject.toml          # Package metadata
+|-- requirements.txt        # Runtime dependency list
+|-- rocketsim/
+|   |-- __init__.py         # Public package exports
+|   |-- simulator.py        # Core numerical integration engine
+|   |-- aerodynamics.py     # Drag, lift, and dynamic pressure calculations
+|   |-- atmosphere.py       # Standard atmosphere and wind model
+|   |-- motor.py            # Motor thrust curves and mass depletion
+|   |-- monte_carlo.py      # Uncertainty propagation
+|   `-- ml_surrogate.py     # NumPy surrogate model
+`-- tests/
+    `-- test_smoke.py       # Fast smoke tests
 ```
 
-### Functional Overview
+## Installation
 
-1. **State Initialization (`main.py`):** The user defines the vehicle geometry, dry mass, motor choice, and launch rail configurations.
-2. **Environmental Modeling (`atmosphere.py`):** Calculates localized air density, temperature, and pressure based on current altitude. It simultaneously applies a wind vector model to simulate lateral forces and weather-cocking during the ascent.
-3. **Propulsion Dynamics (`motor.py`):** Evaluates time-dependent thrust using the motor's specific curve. It dynamically subtracts the burned propellant weight from the total vehicle mass at every time step, updating the vehicle's center of gravity.
-4. **Aerodynamic Forces (`aerodynamics.py`):** Computes instantaneous drag forces using the standard drag equation. It scales the drag coefficient ($C_d$) based on velocity variations.
-5. **Numerical Solver (`simulator.py`):** Acts as the core integration loop. It aggregates thrust, gravity, and aerodynamic vectors to update acceleration, velocity, and position coordinates at high temporal resolution until touchdown.
-6. **Advanced Predictive Analytics (`monte_carlo.py` & `ml_surrogate.py`):** * The **Monte Carlo** module runs thousands of parallel simulations, injecting Gaussian noise into variables like ignition wind angle and total motor impulse to map out a probabilistic landing zone dispersion.
-* The **ML Surrogate** module uses a trained regression model to bypass the physics loop entirely, outputting instant apogee and safety margin predictions based on inputs.
+```bash
+python -m pip install -r requirements.txt
+```
 
----
+For editable local development:
 
-## Technical Specifications
+```bash
+python -m pip install -e .
+```
 
-### Aerodynamic Drag Core
+## Usage
 
-The atmospheric module dynamically recalculates fluid density ($\rho$) as a function of altitude to resolve the drag equation across the flight envelope:
+Run the full demo:
 
-$$F_d = \frac{1}{2} \rho v^2 C_d A$$
+```bash
+python main.py
+```
 
-Where:
+The demo builds a sample rocket, runs a single flight simulation, performs drag
+and thrust parameter sweeps, runs a 50-sample Monte Carlo analysis, trains the
+surrogate model, and estimates parameters from an observed apogee.
 
-* $F_d$ = Drag force vector
-* $\rho$ = Altitude-dependent air density
-* $v$ = Relative velocity vector (including wind components)
-* $C_d$ = Drag coefficient
-* $A$ = Cross-sectional area of the airframe
+## Testing
 
----
+```bash
+python -m unittest discover -s tests
+```
+
+The smoke tests verify that the package imports, a flight produces sane summary
+values, wind affects the horizontal state, and the surrogate model trains and
+predicts.
+
+## Functional Overview
+
+1. **State initialization (`main.py`)**: defines vehicle mass, motor choice,
+   geometry, launch angle, and recovery settings.
+2. **Environmental modeling (`atmosphere.py`)**: calculates temperature,
+   pressure, density, speed of sound, Mach number, and wind vector.
+3. **Propulsion dynamics (`motor.py`)**: evaluates a time-dependent thrust curve
+   and subtracts burned propellant mass during flight.
+4. **Aerodynamic forces (`aerodynamics.py`)**: computes drag, lift, dynamic
+   pressure, and Mach-dependent drag coefficients.
+5. **Numerical solver (`simulator.py`)**: integrates the flight state with RK4
+   until landing and reports apogee, max velocity, max Mach, max acceleration,
+   max dynamic pressure, and total flight time.
+6. **Predictive analytics (`monte_carlo.py`, `ml_surrogate.py`)**: runs
+   uncertainty sweeps and trains a fast quadratic surrogate model for repeated
+   prediction and parameter estimation.
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
-
-```
+Distributed under the MIT License. See `LICENSE.md` for details.

@@ -14,10 +14,8 @@ where I_sp is the specific impulse in seconds.
 """
 
 import numpy as np
-from scipy.interpolate import interp1d
 import csv
 import os
-from typing import Optional
 
 
 class Motor:
@@ -49,6 +47,9 @@ class Motor:
 
         # Sort and unpack thrust data
         thrust_data = sorted(thrust_data, key=lambda x: x[0])
+        if not thrust_data:
+            raise ValueError("thrust_data must contain at least one time/thrust point")
+
         times  = np.array([p[0] for p in thrust_data])
         thrust = np.array([p[1] for p in thrust_data])
 
@@ -62,8 +63,6 @@ class Motor:
 
         self._times  = times
         self._thrust = thrust
-        self._interp = interp1d(times, thrust, kind="linear",
-                                bounds_error=False, fill_value=0.0)
 
         self.burn_time = times[-1]
         self.total_impulse = np.trapezoid(thrust, times)  # N·s
@@ -72,7 +71,7 @@ class Motor:
 
     def thrust(self, t: float) -> float:
         """Return thrust [N] at time t [s]."""
-        return float(self._interp(t))
+        return float(np.interp(t, self._times, self._thrust, left=0.0, right=0.0))
 
     def propellant_remaining(self, t: float) -> float:
         """Approximate propellant remaining [kg] at time t via cumulative impulse."""
@@ -82,7 +81,8 @@ class Motor:
             return 0.0
         # Fraction of total impulse consumed
         t_clipped = np.linspace(0, min(t, self.burn_time), 500)
-        impulse_consumed = np.trapezoid(self._interp(t_clipped), t_clipped)
+        thrust = np.interp(t_clipped, self._times, self._thrust, left=0.0, right=0.0)
+        impulse_consumed = np.trapezoid(thrust, t_clipped)
         fraction_consumed = impulse_consumed / (self.total_impulse + 1e-12)
         return self.propellant_mass_kg * (1.0 - fraction_consumed)
 
