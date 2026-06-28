@@ -149,6 +149,7 @@ def sim_fn(cd_scale, thrust_scale, body_mass_kg, launch_angle_deg, wind_speed_ms
     }
 
 surrogate = MLSurrogate(simulator_fn=sim_fn)
+print(f"\n  ML backend: {surrogate.device_str} (GPU={surrogate.using_gpu})")
 
 print("\n  Generating 60 training samples (LHS)...")
 X, y = surrogate.generate_training_data(n_samples=60, seed=7)

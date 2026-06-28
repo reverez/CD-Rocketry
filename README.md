@@ -5,6 +5,39 @@ rocket flight trajectories. It combines aerodynamic physics, standard
 atmosphere calculations, motor thrust curves, Monte Carlo uncertainty analysis,
 and a lightweight surrogate model for fast performance estimates.
 
+## Quick Start
+
+Create a virtual environment and install the runtime dependencies:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+For the optional GPU environment check:
+
+```bash
+.venv/bin/python -m pip install -r requirements-gpu.txt
+.venv/bin/python check_gpu.py
+```
+
+For an NVIDIA RTX 5070, `check_gpu.py` should report `CUDA available: True` and
+list the GPU name. If it reports `False`, the project can still run on CPU, but
+the operating system, WSL, driver, or container is not exposing the GPU to
+PyTorch.
+
+Run a fast simulation plus ML smoke test:
+
+```bash
+.venv/bin/python smoke_test.py
+```
+
+Run the full demo:
+
+```bash
+.venv/bin/python main.py
+```
+
 ## Project Layout
 
 ```text
@@ -12,6 +45,9 @@ CD-Rocketry/
 |-- main.py                 # End-to-end demo and configuration entry point
 |-- pyproject.toml          # Package metadata
 |-- requirements.txt        # Runtime dependency list
+|-- requirements-gpu.txt    # Optional PyTorch dependency for GPU checks
+|-- check_gpu.py            # PyTorch/CUDA visibility check
+|-- smoke_test.py           # Fast local smoke test
 |-- rocketsim/
 |   |-- __init__.py         # Public package exports
 |   |-- simulator.py        # Core numerical integration engine

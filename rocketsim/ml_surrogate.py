@@ -37,6 +37,8 @@ class MLSurrogate:
         self._x_std = None
         self._weights = {}
         self.is_trained = False
+        self.using_gpu = False
+        self.device_str = "cpu (numpy)"
 
     def generate_training_data(
         self,
